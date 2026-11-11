@@ -1,0 +1,391 @@
+// 회원 데이터베이스 (Firebase Authentication + Cloud Firestore)
+// 가입 · 로그인 정보가 서버(Firebase)에 저장되어 어느 기기에서 가입해도 한곳에 모인다.
+// 비밀번호는 Firebase가 관리하고, 사이트는 비밀번호를 저장하지 않는다.
+// 로그인한 회원 정보는 다른 화면(장바구니 · 마이페이지)이 바로 읽을 수 있도록 localStorage에 사본만 남긴다.
+// 로그인한 회원의 장바구니 · 주문 · 상담 내역도 계정(userdata/{uid})에 저장해 어느 브라우저에서든 이어서 보인다.
+(()=>{
+if(window.SangsangDB)return;
+const CONFIG={
+ apiKey:'AIzaSyDHCpyu5Vh2azygAvgcN08VdIrb7kkPgu8',
+ authDomain:'sangsang-studio.firebaseapp.com',
+ projectId:'sangsang-studio',
+ storageBucket:'sangsang-studio.firebasestorage.app',
+ messagingSenderId:'882254777273',
+ appId:'1:882254777273:web:c618d4a7f70a27fc4cc468'
+};
+const SDK='https://www.gstatic.com/firebasejs/10.12.2/';
+// 아이디로 로그인하도록, Firebase에는 아이디를 이메일 모양으로 바꿔 등록한다 (메일은 보내지 않음)
+const ID_DOMAIN='member.sangsang.example';
+const toEmail=id=>`${id}@${ID_DOMAIN}`;
+// 예전 가입자는 가짜 이메일에서, 새 가입자(진짜 이메일)는 가입 때 저장한 표시 이름(displayName)에서 아이디를 읽는다
+const idOf=user=>!user?null:user.email?.endsWith('@'+ID_DOMAIN)?user.email.slice(0,-ID_DOMAIN.length-1):user.displayName||null;
+// 아이디 · 비밀번호 찾기 질문 (가입할 때 하나 고른다)
+const QUESTIONS=['기억에 남는 추억의 장소는?','자신의 인생 좌우명은?','자신의 보물 제1호는?','가장 기억에 남는 선생님 성함은?','타인이 모르는 자신만의 신체비밀이 있다면?','추억하고 싶은 날짜가 있다면?','받았던 선물 중 기억에 남는 독특한 선물은?','유년시절 가장 생각나는 친구 이름은?','인상 깊게 읽은 책 이름은?','읽은 책 중에서 좋아하는 구절이 있다면?','자신이 두번째로 존경하는 인물은?','친구들에게 공개하지 않은 어릴 적 별명이 있다면?','초등학교 때 기억에 남는 짝꿍 이름은?','다시 태어나면 되고 싶은 것은?','내가 좋아하는 캐릭터는?'];
+// 찾기용 열쇠: '이메일(또는 아이디) + 질문 + 답'을 SHA-256으로 바꾼 값. 답은 그대로 저장하지 않는다 (띄어쓰기 · 대소문자는 무시)
+const norm=s=>String(s||'').trim().toLowerCase().replace(/\s+/g,'');
+async function finderKey(kind,who,q,answer){
+ const buf=await crypto.subtle.digest('SHA-256',new TextEncoder().encode(`${kind}|${norm(who)}|${q}|${norm(answer)}`));
+ return [...new Uint8Array(buf)].map(b=>b.toString(16).padStart(2,'0')).join('');
+}
+const maskEmail=e=>{const [a,d]=String(e).split('@');return (a.length<=2?a[0]+'*':a.slice(0,2)+'*'.repeat(Math.min(6,a.length-2)))+'@'+d};
+const MEMBERS='sangsang-members-v2',SESSION='sangsang-member-session';
+const write=(k,v)=>{try{v==null?localStorage.removeItem(k):localStorage.setItem(k,JSON.stringify(v))}catch{}};
+
+function load(src){return new Promise((ok,fail)=>{const s=document.createElement('script');s.src=src;s.async=false;s.onload=ok;s.onerror=fail;document.head.append(s)})}
+let auth,db,resolveFirst,signingUp=false;
+const firstState=new Promise(r=>{resolveFirst=r});
+async function profileOf(user){
+ const id=idOf(user);if(!id)return null;
+ const snap=await db.doc(`members/${id}`).get();return snap.exists?{id,...snap.data()}:null;
+}
+const FIND_EMAIL='sangsang-find-email',FIND_RESULT='sangsang-find-result';
+// 아이디 찾기 메일의 링크로 들어왔을 때: 그 이메일로 잠깐 로그인해 아이디를 읽고, 결과를 남긴 뒤 로그아웃한다
+async function finishFindLink(){
+ if(!auth.isSignInWithEmailLink(location.href))return;
+ const url=location.href;history.replaceState(null,'',location.pathname);
+ let email=null;try{email=localStorage.getItem(FIND_EMAIL)}catch{}
+ if(!email)email=prompt('아이디를 찾을 때 입력한 이메일을 다시 입력해 주세요.');
+ let result;
+ signingUp=true;
+ try{
+  const cred=await auth.signInWithEmailLink(String(email||'').trim(),url);
+  const id=idOf(cred.user);
+  if(cred.additionalUserInfo?.isNewUser||!id){
+   // 예전 가입자(아이디 모양 이메일로 가입)는 회원 정보의 메일로 만든 찾기 열쇠(mail)로 아이디를 찾는다
+   const old=(await db.doc(`finder/${await finderKey('mail',email,'','')}`).get().catch(()=>null))?.data()?.id;
+   await cred.user.delete().catch(()=>{});
+   result=old?{ok:true,id:old}:{ok:false,text:'이 이메일로 가입한 회원이 없습니다.'};
+  }
+  else result={ok:true,id};
+ }catch(e){result={ok:false,text:'링크가 만료되었거나 이메일이 맞지 않습니다. 아이디 찾기를 다시 해 주세요.'}}
+ finally{
+  await auth.signOut().catch(()=>{});signingUp=false;try{localStorage.removeItem(FIND_EMAIL)}catch{}
+  // 이 동안 건너뛴 로그인 상태 알림을 대신한다 (로그아웃 상태)
+  cache(null);clearLocal();resolveFirst();window.dispatchEvent(new Event('sangsang-member-change'));
+ }
+ try{sessionStorage.setItem(FIND_RESULT,JSON.stringify(result))}catch{}
+ window.dispatchEvent(new Event('sangsang-find-result'));
+}
+// ---------------- 예전 가입자(찾기 기능 전에 가입) ----------------
+// 로그인할 때마다: 표시 이름에 아이디를 넣어 두고(나중에 메일 계정으로 바뀌어도 아이디를 알 수 있게),
+// 회원 정보의 메일로 아이디 찾기 열쇠(mail)를 만든다 → 메일 인증 링크로 아이디를 찾을 수 있다
+// 질문 등록 표시: '질문으로 찾기'에서 질문을 등록하지 않은 회원에게 그렇다고 알려 주기 위한 표시 (답은 들어 있지 않음)
+const markKeys=(id,email)=>Promise.all([finderKey('qmark',id,'',''),finderKey('qmark',email,'','')]);
+async function addKeys(user,profile,keys){
+ const had=new Set(profile.finderKeys||[]),add=keys.filter(k=>!had.has(k));if(!add.length)return;
+ for(const k of add){const ref=db.doc(`finder/${k}`);if(!(await ref.get()).exists)await ref.set({uid:user.uid,id:profile.id})}
+ await db.doc(`members/${profile.id}`).update({finderKeys:firebase.firestore.FieldValue.arrayUnion(...add)});
+}
+async function prepareLegacy(user,profile){
+ // 예전에 글자로 저장해 둔 찾기 답이 있으면 지운다 (로그인할 때 한 번)
+ if(profile.answer!==undefined)await db.doc(`members/${profile.id}`).update({answer:firebase.firestore.FieldValue.delete()}).catch(()=>{});
+ // 질문을 등록한 회원은 질문 등록 표시가 있는지 확인한다 (표시가 생기기 전에 등록한 회원용)
+ if(profile.question)await addKeys(user,profile,await markKeys(profile.id,user.email?.endsWith('@'+ID_DOMAIN)?profile.email:user.email)).catch(()=>{});
+ if(!user.email?.endsWith('@'+ID_DOMAIN))return;
+ if(!user.displayName)await user.updateProfile({displayName:profile.id}).catch(()=>{});
+ if(!profile.email||!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(profile.email))return;
+ await addKeys(user,profile,[await finderKey('mail',profile.email,'','')]);
+}
+const ready=(async()=>{
+ if(!window.firebase?.firestore){for(const f of ['firebase-app-compat.js','firebase-auth-compat.js','firebase-firestore-compat.js'])await load(SDK+f)}
+ const app=firebase.apps.length?firebase.app():firebase.initializeApp(CONFIG);
+ auth=app.auth();db=app.firestore();
+ finishFindLink().catch(()=>{});
+ auth.onAuthStateChanged(async user=>{
+  // 가입 중에는 회원 정보를 아직 만드는 중이라 건너뛴다
+  if(signingUp)return;
+  let profile=null;
+  if(user){
+   try{profile=await profileOf(user)}catch{}
+   // 관리자가 삭제한 계정은 회원 정보가 없으므로 로그인 상태를 풀어 준다
+   if(!profile){await auth.signOut();return}
+  }
+  cache(profile);
+  // 장바구니 · 주문 · 상담 내역을 계정에서 불러오고(로그인), 이 브라우저에서 지운다(로그아웃)
+  if(profile)await pull(user.uid,profile.id).catch(()=>{});else clearLocal();
+  if(profile)prepareLegacy(user,profile).catch(()=>{});
+  resolveFirst();
+  window.dispatchEvent(new Event('sangsang-member-change'));
+ });
+})();
+ready.catch(()=>resolveFirst());
+
+// 다른 스크립트가 읽는 로그인 사본 (현재 로그인한 회원 한 명만)
+function cache(p){
+ if(!p){write(SESSION,null);write(MEMBERS,null);return}
+ const {id,uid,answer,...rest}=p;
+ write(SESSION,{id,name:p.name});write(MEMBERS,{[id]:rest});
+}
+const errCode=e=>String(e?.code||'').replace('auth/','');
+
+// ---------------- 장바구니 · 주문 · 상담 내역을 회원 계정(Firestore)에 저장 ----------------
+// 화면 스크립트(cart.js · cart-page.js · mypage.js · inquiry.js)는 지금처럼 localStorage를 읽고 쓴다.
+// 여기서 로그인한 회원의 값만 서버 userdata/{uid}와 맞춰, 다른 브라우저 · 기기에서 다시 로그인해도 그대로 보인다.
+//  userdata/{uid}              cart: { items, nextId }  (상품마다 담은 시각 addedAt)
+//  userdata/{uid}/orders/{no}  주문 1건
+//  userdata/{uid}/consults/{key} 결제 전 상담 신청 1건
+// 장바구니(sangsang-cart-v1)는 개인 견적서(sangsang-studio-draft-v1)와 따로 저장한다.
+const CART='sangsang-cart-v1',ORDERS='sangsang-orders',INQUIRIES='sangsang-studio-inquiries-v1';
+const OWNER='sangsang-data-owner',PENDING='sangsang-cart-pending';
+const read=(k,d)=>{try{return JSON.parse(localStorage.getItem(k))??d}catch{return d}};
+let syncUid=null,syncId=null,applying=false,cartTimer=0;
+const userDoc=()=>db.doc(`userdata/${syncUid}`);
+const consultKey=r=>String(r.savedAt||'').replace(/[^0-9A-Za-z]/g,'');
+const myOrders=id=>(read(ORDERS,[])||[]).filter(o=>o&&o.memberId===id&&o.no);
+const myConsults=id=>(read(INQUIRIES,[])||[]).filter(r=>r&&r.memberId===id&&r.savedAt);
+const cartOf=()=>{const c=read(CART,{})||{};return {items:Array.isArray(c.items)?c.items:[],nextId:Number(c.nextId)||0}};
+// Firestore는 undefined 값을 받지 않으므로 JSON으로 한 번 정리해서 보낸다
+const plain=v=>JSON.parse(JSON.stringify(v));
+// 우리가 고친 값은 다시 서버로 보내지 않도록 applying 동안 쓴다
+function apply(k,v){applying=true;try{localStorage.setItem(k,JSON.stringify(v))}catch{}finally{applying=false}}
+function notify(){window.dispatchEvent(new Event('sangsang-cart-change'));window.dispatchEvent(new Event('sangsang-data-sync'))}
+
+function pushCart(){
+ clearTimeout(cartTimer);
+ cartTimer=setTimeout(()=>{if(!syncUid)return;userDoc().set({cart:plain(cartOf()),updatedAt:new Date().toISOString()},{merge:true}).then(()=>{try{localStorage.removeItem(PENDING)}catch{}}).catch(()=>{})},400);
+}
+async function pushMissing(){
+ if(!syncUid)return;
+ const ref=userDoc(),done=[];
+ for(const o of myOrders(syncId))if(!known.orders.has(o.no)){known.orders.add(o.no);done.push(ref.collection('orders').doc(o.no).set(plain(o)))}
+ for(const r of myConsults(syncId)){const k=consultKey(r);if(!known.consults.has(k)){known.consults.add(k);done.push(ref.collection('consults').doc(k).set(plain(r)))}}
+ await Promise.all(done).catch(()=>{});
+}
+const known={orders:new Set(),consults:new Set()};
+
+// 로그인했을 때: 계정에 저장된 값을 이 브라우저로 불러온다
+async function pull(uid,id){
+ const ref=db.doc(`userdata/${uid}`);
+ const [snap,os,cs]=await Promise.all([ref.get(),ref.collection('orders').get(),ref.collection('consults').get()]);
+ const owner=read(OWNER,null),local=cartOf(),server=snap.data()?.cart;
+ let items=Array.isArray(server?.items)?server.items:[],next=Number(server?.nextId??server?.nextVideoId)||0,changed=false;
+ if(owner?.id===id&&read(PENDING,false)){
+  // 같은 회원이 저장되기 전에 고친 장바구니는 이 브라우저 값을 쓴다
+  items=local.items;next=local.nextId;changed=true;
+ }else if(owner?.id!==id&&local.items.length){
+  // 로그인 전에 비회원으로 담은 영상은 회원 장바구니에 더한다 (담은 시각이 달라 합치지 않는다)
+  items=items.map(i=>({...i}));next=Math.max(next,...items.map(i=>Number(i.id)||0));
+  for(const it of local.items)items.push({...it,id:String(++next)});
+  changed=true;
+ }
+ apply(CART,{items,nextId:next});
+ const serverOrders=os.docs.map(x=>x.data()),serverConsults=cs.docs.map(x=>x.data());
+ known.orders=new Set(serverOrders.map(o=>o.no));known.consults=new Set(cs.docs.map(x=>x.id));
+ // 이 브라우저에만 있던 내 주문 · 상담(예전 시연 기록)은 계정으로 올리고, 계정에 있는 것은 이 브라우저에 채운다
+ const otherOrders=(read(ORDERS,[])||[]).filter(o=>o?.memberId!==id),localMine=myOrders(id);
+ apply(ORDERS,[...otherOrders,...serverOrders,...localMine.filter(o=>!known.orders.has(o.no))]);
+ const otherConsults=(read(INQUIRIES,[])||[]).filter(r=>r?.memberId!==id),localConsults=myConsults(id);
+ apply(INQUIRIES,[...otherConsults,...serverConsults,...localConsults.filter(r=>!known.consults.has(consultKey(r)))]);
+ apply(OWNER,{id,uid});
+ syncUid=uid;syncId=id;
+ if(changed)pushCart();
+ await pushMissing();
+ notify();
+}
+// 로그아웃했을 때: 그 회원의 장바구니 · 주문 · 상담을 이 브라우저에서 지운다 (계정에는 남아 있음)
+function clearLocal(){
+ syncUid=null;syncId=null;clearTimeout(cartTimer);
+ const owner=read(OWNER,null);if(!owner)return;
+ apply(CART,{items:[],nextId:0});
+ apply(ORDERS,(read(ORDERS,[])||[]).filter(o=>o?.memberId!==owner.id));
+ apply(INQUIRIES,(read(INQUIRIES,[])||[]).filter(r=>r?.memberId!==owner.id));
+ try{localStorage.removeItem(OWNER);localStorage.removeItem(PENDING)}catch{}
+ notify();
+}
+// 화면 스크립트가 localStorage에 쓸 때마다 로그인한 회원의 값이면 서버에도 저장한다
+const nativeSet=Storage.prototype.setItem;
+Storage.prototype.setItem=function(k,v){
+ nativeSet.call(this,k,v);
+ if(applying||this!==window.localStorage)return;
+ // 저장이 끝나기 전에 페이지를 옮겨도 다음 페이지에서 이어 보내도록 '보내는 중' 표시를 남긴다
+ if(k===CART&&read(OWNER,null)){nativeSet.call(this,PENDING,'true');if(syncUid)pushCart()}
+ else if((k===ORDERS||k===INQUIRIES)&&syncUid)pushMissing();
+};
+async function removeUserData(uid){
+ const ref=db.doc(`userdata/${uid}`);
+ const [os,cs]=await Promise.all([ref.collection('orders').get(),ref.collection('consults').get()]);
+ const b=db.batch();os.docs.concat(cs.docs).forEach(x=>b.delete(x.ref));b.delete(ref);await b.commit();
+}
+
+window.SangsangDB={
+ ready,
+ whenAuthKnown:()=>ready.then(()=>firstState),
+ // 아이디 중복 확인: usernames 컬렉션에는 아이디 → uid 만 저장되어 누구나 존재 여부만 확인할 수 있다
+ async isIdTaken(id){await ready;return (await db.doc(`usernames/${id}`).get()).exists},
+ questions:QUESTIONS,
+ // 가입: 진짜 이메일로 계정을 만든다. 찾기 질문의 답은 열쇠(finder)로만 남긴다
+ async signup({id,password,name,phone,email,address,question,answer}){
+  await ready;signingUp=true;
+  try{
+   const cred=await auth.createUserWithEmailAndPassword(email,password);
+   const user=cred.user,uid=user.uid;
+   await user.updateProfile({displayName:id});
+   // 찾기 질문은 선택: 답을 넣은 경우에만 질문으로 찾는 열쇠와 질문 등록 표시를 만든다 (안 넣어도 메일 인증으로 찾을 수 있음)
+   const withQ=!!(question&&String(answer||'').trim());
+   const keys=withQ?[await finderKey('id',email,question,answer),await finderKey('pw',id,question,answer),...await markKeys(id,email)]:[];
+   const b=db.batch();
+   b.set(db.doc(`usernames/${id}`),{uid,email});
+   // 찾기 질문의 답은 글자로 남기지 않는다 (암호화한 열쇠로만 비교 → 관리자도 답을 볼 수 없다)
+   b.set(db.doc(`members/${id}`),{uid,name,phone,email,address,...(withQ?{question}:{}),finderKeys:keys,joined:new Date().toISOString()});
+   if(withQ){b.set(db.doc(`finder/${keys[0]}`),{uid,id});b.set(db.doc(`finder/${keys[1]}`),{uid,email});b.set(db.doc(`finder/${keys[2]}`),{uid,id});b.set(db.doc(`finder/${keys[3]}`),{uid,id})}
+   try{await b.commit()}catch(e){await user.delete().catch(()=>{});throw e}
+   // 가입 인증 메일은 보내지 않는다 (인증 없이도 메일로 아이디 · 비밀번호를 찾을 수 있음)
+  }finally{
+   signingUp=false;
+   // 기존 흐름처럼 가입 후에는 로그인 화면으로 보낸다
+   await auth.signOut().catch(()=>{});
+  }
+ },
+ // 로그인 후 회원 정보를 바로 돌려준다 (환영 문구에 이름을 쓰기 위해)
+ async login(id,password){
+  await ready;
+  // 새 가입자는 usernames에 저장한 이메일로, 예전 가입자는 아이디 모양 이메일로 로그인한다
+  const email=(await db.doc(`usernames/${id}`).get().catch(()=>null))?.data()?.email||toEmail(id);
+  // 예전 가입자가 메일 인증을 아직 안 끝냈으면 로그인 계정은 아직 아이디 모양 이메일이므로 한 번 더 시도한다
+  const {user}=await auth.signInWithEmailAndPassword(email,password).catch(e=>{if(email!==toEmail(id)&&['invalid-credential','wrong-password','user-not-found','invalid-login-credentials'].includes(errCode(e)))return auth.signInWithEmailAndPassword(toEmail(id),password);throw e});
+  const profile=await profileOf(user);
+  if(!profile){await auth.signOut();throw {code:'deleted'}}
+  cache(profile);window.dispatchEvent(new Event('sangsang-member-change'));
+  return profile;
+ },
+ async logout(){await ready;await auth.signOut()},
+ // 아이디 찾기: 가입 이메일 + 질문 + 답이 모두 맞으면 아이디를 돌려준다 (없으면 null)
+ async findId(email,question,answer){await ready;return (await db.doc(`finder/${await finderKey('id',email,question,answer)}`).get()).data()?.id||null},
+ // 이 아이디(또는 메일)로 찾기 질문을 등록했는지 (질문으로 못 찾았을 때 안내 문구를 고르기 위해)
+ async hasQuestion(who){await ready;return (await db.doc(`finder/${await finderKey('qmark',who,'','')}`).get()).exists},
+ async idExists(id){await ready;return (await db.doc(`usernames/${String(id).toLowerCase()}`).get()).exists},
+ // 비밀번호 찾기: 아이디 + 질문 + 답이 맞으면 가입 이메일로 재설정 메일을 보내고, 가린 이메일을 돌려준다 (없으면 null)
+ async resetPassword(id,question,answer){
+  await ready;const email=(await db.doc(`finder/${await finderKey('pw',id,question,answer)}`).get()).data()?.email;
+  if(!email)return null;await auth.sendPasswordResetEmail(email);return maskEmail(email);
+ },
+ // 비밀번호 찾기(이메일 인증): 아이디와 가입 이메일이 맞으면 재설정 메일을 보낸다
+ async resetByEmail(id,email){
+  await ready;const saved=(await db.doc(`usernames/${id}`).get()).data()?.email;
+  if(!saved||norm(saved)!==norm(email))return null;
+  await auth.sendPasswordResetEmail(saved);return maskEmail(saved);
+ },
+ // 아이디 찾기(이메일 인증): 가입 이메일로 확인 링크를 보내고, 링크를 누르면 아이디를 보여 준다
+ async sendFindIdLink(email){
+  await ready;
+  await auth.sendSignInLinkToEmail(email,{url:location.origin+location.pathname+'?find=id',handleCodeInApp:true});
+  try{localStorage.setItem(FIND_EMAIL,email)}catch{}
+ },
+ // 찾기 질문을 아직 등록하지 않은 회원(예전 가입자 등)인지
+ async needsFindSetup(){
+  await ready;const u=auth.currentUser,id=idOf(u);if(!u||!id)return false;
+  // 안내창은 찾기 기능 전에 가입한 회원에게만 (새 가입자는 가입할 때 질문을 고를 수 있었으므로 띄우지 않음)
+  if(!u.email?.endsWith('@'+ID_DOMAIN))return false;
+  return !(await db.doc(`members/${id}`).get()).data()?.question;
+ },
+ isLegacy(){return !!auth?.currentUser?.email?.endsWith('@'+ID_DOMAIN)},
+ // 찾기 정보 등록 · 변경: 비밀번호 확인 → 질문 · 답으로 새 열쇠를 만들고 예전 열쇠는 지운다.
+ // 예전 가입자는 메일 인증 링크를 보내, 인증하면 로그인 계정이 그 메일로 바뀌어 메일로 비밀번호 재설정도 된다
+ async setupFind({password,question,answer,email}){
+  await ready;const u=auth.currentUser,id=idOf(u);if(!u||!id)throw {code:'permission-denied'};
+  await u.reauthenticateWithCredential(firebase.auth.EmailAuthProvider.credential(u.email,password));
+  const legacy=u.email.endsWith('@'+ID_DOMAIN),mail=legacy?email:u.email;
+  const ref=db.doc(`members/${id}`),old=(await ref.get()).data()||{};
+  const idKey=await finderKey('id',mail,question,answer),pwKey=await finderKey('pw',id,question,answer);
+  const mailKey=legacy?await finderKey('mail',mail,'',''):null;
+  const marks=await markKeys(id,mail);
+  const keep=new Set([idKey,pwKey,mailKey,...marks].filter(Boolean));
+  const b=db.batch();
+  for(const k of old.finderKeys||[])if(!keep.has(k))b.delete(db.doc(`finder/${k}`));
+  // 열쇠 문서는 새로 만들기만 할 수 있으므로(규칙), 이미 있는 열쇠는 그대로 둔다
+  const had=new Set(old.finderKeys||[]);
+  if(!had.has(idKey))b.set(db.doc(`finder/${idKey}`),{uid:u.uid,id});
+  if(!had.has(pwKey))b.set(db.doc(`finder/${pwKey}`),{uid:u.uid,email:mail});
+  if(mailKey&&!had.has(mailKey))b.set(db.doc(`finder/${mailKey}`),{uid:u.uid,id});
+  for(const k of new Set(marks))if(!had.has(k))b.set(db.doc(`finder/${k}`),{uid:u.uid,id});
+  b.update(ref,{question,answer:firebase.firestore.FieldValue.delete(),finderKeys:[...keep],email:mail});
+  if(legacy)b.update(db.doc(`usernames/${id}`),{email:mail});
+  await b.commit();
+  let mailSent=false;
+  if(legacy){if(!u.displayName)await u.updateProfile({displayName:id}).catch(()=>{});await u.verifyBeforeUpdateEmail(mail).then(()=>{mailSent=true}).catch(()=>{})}
+  const s=await ref.get();cache({id,...s.data()});window.dispatchEvent(new Event('sangsang-member-change'));
+  return {legacy,mailSent};
+ },
+ async resendVerification(){await ready;await auth.currentUser?.sendEmailVerification()},
+ emailVerified(){const u=auth?.currentUser;return !u||u.email?.endsWith('@'+ID_DOMAIN)?null:u.emailVerified},
+ current(){const id=idOf(auth?.currentUser);return id?{id}:null},
+ async isAdmin(){await ready;const u=auth.currentUser;if(!u)return false;try{return (await db.doc(`admins/${u.uid}`).get()).exists}catch{return false}},
+ // 예전에 글자로 저장된 찾기 답이 남아 있으면 관리자가 목록을 열 때 모두 지운다 (관리자 화면에도 답을 넘기지 않음)
+ async listMembers(){await ready;const docs=(await db.collection('members').get()).docs;
+  for(const d of docs)if('answer' in d.data())d.ref.update({answer:firebase.firestore.FieldValue.delete()}).catch(()=>{});
+  return docs.map(d=>{const {answer,...rest}=d.data();return {id:d.id,...rest}})},
+ // 비회원 주문도 관리자가 볼 수 있도록 guestOrders에 남긴다 (읽기는 관리자만)
+ async saveGuestOrder(order){await ready;if(!order?.no||order.memberId)return;await db.doc(`guestOrders/${order.no}`).set(plain(order))},
+ async listGuestOrders(){await ready;return (await db.collection('guestOrders').get()).docs.map(d=>d.data())},
+ // 관리자: 회원 한 명의 장바구니와 주문 내역
+ async memberActivity(uid){
+  await ready;const ref=db.doc(`userdata/${uid}`);
+  const [snap,os,cs]=await Promise.all([ref.get(),ref.collection('orders').get(),ref.collection('consults').get().catch(()=>null)]);
+  return {cart:snap.data()?.cart?.items||[],orders:os.docs.map(d=>d.data()),consults:cs?cs.docs.map(d=>d.data()):[],points:Number(snap.data()?.points?.balance)||0};
+ },
+ // 포인트: userdata/{uid}.points = { balance, history:[{date,type,amount,memo}] }
+ // 충전 · 사용은 트랜잭션으로 처리해 두 창에서 동시에 써도 잔액이 꼬이지 않는다 (충전 결제는 시안)
+ async points(){
+  await ready;const u=auth.currentUser;if(!u)return {balance:0,history:[]};
+  const p=(await db.doc(`userdata/${u.uid}`).get()).data()?.points||{};
+  return {balance:Number(p.balance)||0,history:Array.isArray(p.history)?p.history:[]};
+ },
+ async changePoints(amount,type,memo){
+  await ready;const u=auth.currentUser;if(!u)throw {code:'permission-denied'};
+  const ref=db.doc(`userdata/${u.uid}`);
+  const result=await db.runTransaction(async t=>{
+   const p=(await t.get(ref)).data()?.points||{},balance=Number(p.balance)||0,next=balance+amount;
+   if(next<0)throw {code:'not-enough-points'};
+   const history=[{date:new Date().toISOString(),type,amount,memo},...(Array.isArray(p.history)?p.history:[])].slice(0,50);
+   t.set(ref,{points:{balance:next,history}},{merge:true});
+   return {balance:next,history};
+  });
+  window.dispatchEvent(new Event('sangsang-points-change'));
+  return result;
+ },
+ async updateMember(id,data){
+  await ready;await db.doc(`members/${id}`).update(data);
+  if(idOf(auth.currentUser)===id){const s=await db.doc(`members/${id}`).get();cache({id,...s.data()});window.dispatchEvent(new Event('sangsang-member-change'))}
+ },
+ // 본인 정보 수정: 현재 비밀번호로 한 번 더 확인한 뒤 고친다 (새 비밀번호를 넣으면 비밀번호도 바꾼다)
+ async verifyPassword(password){
+  await ready;const u=auth.currentUser;if(!u)throw {code:'permission-denied'};
+  await u.reauthenticateWithCredential(firebase.auth.EmailAuthProvider.credential(u.email,password));
+ },
+ async updateMyInfo(password,data,newPassword){
+  await ready;const u=auth.currentUser,id=idOf(u);if(!u||!id)throw {code:'permission-denied'};
+  await u.reauthenticateWithCredential(firebase.auth.EmailAuthProvider.credential(u.email,password));
+  await db.doc(`members/${id}`).update(data);
+  if(newPassword)await u.updatePassword(newPassword);
+  const s=await db.doc(`members/${id}`).get();cache({id,...s.data()});window.dispatchEvent(new Event('sangsang-member-change'));
+ },
+ // 관리자 삭제: 회원 정보와 아이디를 지운다 (로그인 계정은 남지만 회원 정보가 없어 로그인되지 않음)
+ async deleteMember(id){
+  await ready;
+  const data=(await db.doc(`members/${id}`).get()).data()||{},uid=data.uid;
+  if(uid)await removeUserData(uid).catch(()=>{});
+  const b=db.batch();(data.finderKeys||[]).forEach(k=>b.delete(db.doc(`finder/${k}`)));b.delete(db.doc(`members/${id}`));b.delete(db.doc(`usernames/${id}`));await b.commit()},
+ // 본인 탈퇴: 회원 정보 · 아이디 · 장바구니 · 주문 · 상담 내역 · 로그인 계정을 모두 지운다
+ async leave(){
+  await ready;const u=auth.currentUser,id=idOf(u);if(!u||!id)return;
+  await removeUserData(u.uid);
+  const keys=(await db.doc(`members/${id}`).get()).data()?.finderKeys||[];
+  const b=db.batch();keys.forEach(k=>b.delete(db.doc(`finder/${k}`)));b.delete(db.doc(`members/${id}`));b.delete(db.doc(`usernames/${id}`));await b.commit();
+  await u.delete().catch(()=>auth.signOut());
+ },
+ errorText(e){
+  const c=errCode(e);
+  if(c==='email-already-in-use')return '이미 가입된 이메일입니다. 아이디 찾기를 이용해 주세요.';
+  if(c==='invalid-email')return '이메일 주소를 다시 확인해 주세요.';
+  if(c==='operation-not-allowed'||c==='unauthorized-continue-uri'||c==='unauthorized-domain')return '이메일 인증 설정이 아직 준비되지 않았습니다. 질문으로 인증을 이용해 주세요.';
+  if(c==='deleted')return '삭제된 계정입니다. 관리자에게 문의해 주세요.';
+  if(['invalid-credential','wrong-password','user-not-found','invalid-login-credentials'].includes(c))return auth?.currentUser?'비밀번호가 맞지 않습니다.':'아이디 또는 비밀번호가 맞지 않습니다.';
+  if(c==='too-many-requests')return '로그인 시도가 너무 많습니다. 잠시 후 다시 시도해 주세요.';
+  if(c==='network-request-failed')return '인터넷 연결을 확인해 주세요.';
+  if(c==='weak-password')return '비밀번호가 너무 쉽습니다. 영문 · 숫자를 섞어 8자 이상 입력해 주세요.';
+  if(c==='permission-denied')return '권한이 없습니다.';
+  if(c==='not-enough-points')return '포인트가 부족합니다.';
+  return '잠시 후 다시 시도해 주세요.';
+ }
+};
+})();
